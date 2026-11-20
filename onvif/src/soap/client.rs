@@ -44,6 +44,7 @@ impl ClientBuilder {
                 reuse_digest_auth_headers: false,
                 timeout: ClientBuilder::DEFAULT_TIMEOUT,
                 fix_time_gap: None,
+                allow_username_token_over_http: false,
                 #[cfg(feature = "tls")]
                 tls: TlsConfig::default(),
             },
@@ -82,6 +83,17 @@ impl ClientBuilder {
 
     pub fn fix_time_gap(mut self, time_gap: Option<chrono::Duration>) -> Self {
         self.config.fix_time_gap = time_gap;
+        self
+    }
+
+    /// Allows WS-Security UsernameToken auth on plain `http://` URIs.
+    ///
+    /// Off by default: over plain HTTP, anyone who captures a UsernameToken request can guess the
+    /// password offline from its SHA-1 digest, and ONVIF advises against it. Without this, the
+    /// client uses UsernameToken only over HTTPS, and [AuthType::Any] does not fall back to it
+    /// over HTTP. Turn it on for cameras that support nothing else, on a network you trust.
+    pub fn allow_username_token_over_http(mut self, allow: bool) -> Self {
+        self.config.allow_username_token_over_http = allow;
         self
     }
 
@@ -189,6 +201,7 @@ struct Config {
     reuse_digest_auth_headers: bool,
     timeout: Duration,
     fix_time_gap: Option<chrono::Duration>,
+    allow_username_token_over_http: bool,
     #[cfg(feature = "tls")]
     tls: TlsConfig,
 }
@@ -203,11 +216,16 @@ struct TlsConfig {
 
 #[derive(Clone, Debug)]
 pub enum AuthType {
-    /// First try to authorize with Digest and in case of error try UsernameToken auth
+    /// First try to authorize with Digest and in case of error try UsernameToken auth.
+    ///
+    /// Over plain HTTP, the fallback to UsernameToken needs
+    /// [ClientBuilder::allow_username_token_over_http].
     Any,
     /// Use only Digest auth
     Digest,
-    /// Use only UsernameToken auth
+    /// Use only UsernameToken auth.
+    ///
+    /// Over plain HTTP, this needs [ClientBuilder::allow_username_token_over_http].
     UsernameToken,
 }
 
@@ -287,6 +305,16 @@ impl Client {
             RequestAuthType::UsernameToken => self.username_token_auth(),
             _ => None,
         };
+
+        if username_token.is_some()
+            && uri.scheme() != "https"
+            && !self.config.allow_username_token_over_http
+        {
+            return Err(Error::Authorization(
+                "UsernameToken over plain HTTP is disabled; use HTTPS or allow_username_token_over_http"
+                    .to_string(),
+            ));
+        }
 
         debug!(?auth_type, %redirections, "About to make request.");
 

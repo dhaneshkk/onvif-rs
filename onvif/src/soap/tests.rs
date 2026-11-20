@@ -196,6 +196,7 @@ async fn authorization_error_reports_digest_and_username_token_results() {
 
     let client = ClientBuilder::new(&uri)
         .credentials(Some(credentials()))
+        .allow_username_token_over_http(true)
         .build();
 
     let error = client.request("<Good/>").await.unwrap_err();
@@ -203,6 +204,78 @@ async fn authorization_error_reports_digest_and_username_token_results() {
         error.to_string(),
         "Authorization failed: Digest: 401 Unauthorized, UsernameToken: 401 Unauthorized"
     );
+}
+
+#[tokio::test]
+async fn any_auth_does_not_fall_back_to_username_token_over_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let username_tokens = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_digest_rejecting_and_count_username_tokens(
+        listener,
+        username_tokens.clone(),
+    ));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Authorization failed: Digest: 401 Unauthorized, UsernameToken: UsernameToken over plain \
+         HTTP is disabled; use HTTPS or allow_username_token_over_http"
+    );
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn username_token_over_http_needs_opt_in() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let username_tokens = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_digest_rejecting_and_count_username_tokens(
+        listener,
+        username_tokens.clone(),
+    ));
+
+    let strict = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::UsernameToken)
+        .build();
+    strict.request("<Good/>").await.unwrap_err();
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 0);
+
+    let allowed = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::UsernameToken)
+        .allow_username_token_over_http(true)
+        .build();
+    allowed.request("<Good/>").await.unwrap();
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 1);
+}
+
+/// Answers UsernameToken requests with success and counts them; challenges everything else.
+async fn serve_digest_rejecting_and_count_username_tokens(
+    listener: TcpListener,
+    username_tokens: Arc<AtomicUsize>,
+) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = if request.contains("UsernameToken") {
+            username_tokens.fetch_add(1, Ordering::SeqCst);
+            let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#;
+            http_response("200 OK", "", envelope)
+        } else {
+            let challenge =
+                "WWW-Authenticate: Digest realm=\"test\", qop=\"auth\", nonce=\"nonce\"\r\n";
+            http_response("401 Unauthorized", challenge, "")
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
 }
 
 #[tokio::test]
