@@ -83,10 +83,13 @@ async fn main() {
         },
     };
 
-    // Main Loop
+    // Main Loop, until Ctrl-C
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     loop {
-        let pull_messages_response =
-            event::pull_messages(&pull_msg_client, &pull_messages_request).await;
+        let pull_messages_response = tokio::select! {
+            response = event::pull_messages(&pull_msg_client, &pull_messages_request) => response,
+            _ = &mut ctrl_c => break,
+        };
         let msg = match pull_messages_response {
             Ok(msg) => msg,
             Err(e) => {
@@ -100,6 +103,15 @@ async fn main() {
             println!("No new notification message");
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {}
+            _ = &mut ctrl_c => break,
+        }
+    }
+
+    // Free the subscription on the camera instead of leaving it until it times out.
+    match event::unsubscribe(&pull_msg_client, &Default::default()).await {
+        Ok(_) => println!("Unsubscribed"),
+        Err(e) => println!("Unsubscribe failed: {:?}", e),
     }
 }

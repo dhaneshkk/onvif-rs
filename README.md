@@ -20,16 +20,29 @@ Cargo.toml:
 onvif = { git = "https://github.com/lumeohq/onvif-rs" }
 ```
 
+## Security defaults
+
+- **HTTPS certificates are verified** (`tls` feature). To trust a camera's self-signed
+  certificate, pin it with `ClientBuilder::add_root_certificate`. If the certificate doesn't list
+  the camera's IP address, also set `danger_accept_invalid_hostnames(true)`.
+  `danger_accept_invalid_certs(true)` turns verification off completely.
+- **UsernameToken auth is not sent over plain HTTP.** Its SHA-1 password digest can be cracked
+  offline. `AuthType::Any` uses only Digest over HTTP. For cameras that support nothing else, set
+  `allow_username_token_over_http(true)`.
+- **Redirects** keep the credentials on the same host, never go from HTTPS to HTTP, and are
+  limited by `max_redirections` (default 1).
+- **Response bodies** are capped at `max_response_bytes` (default 16 MiB).
+- **Rejected logins are counted across clones of a client**, which stops it before a camera
+  locks the account. Because of this, requests through one client run one at a time. Use
+  `Client::with_own_auth_state()` for work that should run in parallel.
+
 ## Troubleshooting
 
-If you have an issue with OpenSSL build under Ubuntu, perform the following actions:
+The `tls` feature uses the system's OpenSSL through `native-tls`. If the build can't find it on
+Debian or Ubuntu, install the development package:
 
 ```
-sudo apt install openssl1.0 libssl1.0.0 libssl1.0-dev
-cargo clean
-export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
-export OPENSSL_INCLUDE_DIR=/usr/include/openssl
-cargo build
+sudo apt install pkg-config libssl-dev
 ```
 
 ## Examples

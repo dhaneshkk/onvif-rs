@@ -17,6 +17,12 @@ use std::{
 use tracing::{debug, instrument, trace};
 use url::Url;
 
+/// An ONVIF SOAP client for one service URI.
+///
+/// Clones share the Digest auth state, so that rejected logins are counted across all of them
+/// and the client stops before a camera locks the account. Sharing that state means requests made
+/// through one client and its clones run one at a time. For requests that should run in parallel,
+/// such as an event pull loop next to PTZ commands, use [Client::with_own_auth_state].
 #[derive(Clone)]
 pub struct Client {
     client: reqwest::Client,
@@ -32,6 +38,8 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_REDIRECTIONS: u32 = 1;
+    pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
     pub fn new(uri: &Url) -> Self {
         Self {
@@ -44,6 +52,11 @@ impl ClientBuilder {
                 reuse_digest_auth_headers: false,
                 timeout: ClientBuilder::DEFAULT_TIMEOUT,
                 fix_time_gap: None,
+                allow_username_token_over_http: false,
+                max_redirections: ClientBuilder::DEFAULT_MAX_REDIRECTIONS,
+                max_response_bytes: ClientBuilder::DEFAULT_MAX_RESPONSE_BYTES,
+                #[cfg(feature = "tls")]
+                tls: TlsConfig::default(),
             },
         }
     }
@@ -83,14 +96,98 @@ impl ClientBuilder {
         self
     }
 
+    /// How many redirects to follow for one request. Default:
+    /// [ClientBuilder::DEFAULT_MAX_REDIRECTIONS].
+    ///
+    /// Redirects carry the credentials, so only redirects to the same host are followed, and
+    /// never from HTTPS to HTTP.
+    pub fn max_redirections(mut self, max_redirections: u32) -> Self {
+        self.config.max_redirections = max_redirections;
+        self
+    }
+
+    /// The largest response body to read, in bytes. Larger responses fail with a protocol error
+    /// instead of being read into memory. Default: [ClientBuilder::DEFAULT_MAX_RESPONSE_BYTES].
+    pub fn max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.config.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// Allows WS-Security UsernameToken auth on plain `http://` URIs.
+    ///
+    /// Off by default: over plain HTTP, anyone who captures a UsernameToken request can guess the
+    /// password offline from its SHA-1 digest, and ONVIF advises against it. Without this, the
+    /// client uses UsernameToken only over HTTPS, and [AuthType::Any] does not fall back to it
+    /// over HTTP. Turn it on for cameras that support nothing else, on a network you trust.
+    pub fn allow_username_token_over_http(mut self, allow: bool) -> Self {
+        self.config.allow_username_token_over_http = allow;
+        self
+    }
+
+    /// Trusts `certificate` as a root CA for HTTPS, in addition to the system roots.
+    ///
+    /// Use this for a site CA or for the camera's own self-signed certificate (pinning). Ignored
+    /// if a client is given with [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn add_root_certificate(mut self, certificate: reqwest::Certificate) -> Self {
+        self.config.tls.root_certificates.push(certificate);
+        self
+    }
+
+    /// Accepts any HTTPS certificate, including expired, self-signed and forged ones.
+    ///
+    /// Off by default. Turning it on makes HTTPS open to man-in-the-middle attacks, so prefer
+    /// [ClientBuilder::add_root_certificate]. Ignored if a client is given with
+    /// [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+        self.config.tls.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Accepts HTTPS certificates whose names do not match the host, while still checking that a
+    /// trusted CA signed them.
+    ///
+    /// Off by default. Cameras are often reached by an IP address that is missing from their
+    /// certificate; this allows that with a pinned certificate. Ignored if a client is given with
+    /// [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn danger_accept_invalid_hostnames(mut self, accept_invalid_hostnames: bool) -> Self {
+        self.config.tls.accept_invalid_hostnames = accept_invalid_hostnames;
+        self
+    }
+
+    /// Builds the client.
+    ///
+    /// # Panics
+    ///
+    /// If the HTTP client cannot be built, for example when the TLS backend fails to initialize.
+    /// Use [ClientBuilder::try_build] to handle that as an error.
     pub fn build(self) -> Client {
+        self.try_build().expect("Failed to build the HTTP client")
+    }
+
+    /// Builds the client, or returns the error if the HTTP client cannot be built.
+    pub fn try_build(self) -> Result<Client, reqwest::Error> {
         let client = if let Some(client) = self.client {
             client
         } else {
-            ClientBuilder::default_http_client_builder()
-                .timeout(self.config.timeout)
-                .build()
-                .unwrap()
+            #[allow(unused_mut)]
+            let mut builder =
+                ClientBuilder::default_http_client_builder().timeout(self.config.timeout);
+
+            #[cfg(feature = "tls")]
+            {
+                let tls = &self.config.tls;
+                for certificate in &tls.root_certificates {
+                    builder = builder.add_root_certificate(certificate.clone());
+                }
+                builder = builder
+                    .danger_accept_invalid_certs(tls.accept_invalid_certs)
+                    .danger_accept_invalid_hostnames(tls.accept_invalid_hostnames);
+            }
+
+            builder.build()?
         };
 
         let digest = Digest::new(
@@ -99,13 +196,15 @@ impl ClientBuilder {
             self.config.reuse_digest_auth_headers,
         );
 
-        Client {
+        Ok(Client {
             client,
             config: self.config,
             digest_auth_state: Arc::new(Mutex::new(digest)),
-        }
+        })
     }
 
+    /// The HTTP client builder this crate starts from: redirects off (they are handled per
+    /// request) and, with the `tls` feature, native TLS that verifies certificates.
     pub fn default_http_client_builder() -> reqwest::ClientBuilder {
         #[allow(unused_mut)]
         let mut client_builder =
@@ -113,12 +212,7 @@ impl ClientBuilder {
 
         #[cfg(feature = "tls")]
         {
-            // hyper-rustls does not support IP hosts (like https://192.168.1.2) which are
-            // very common for IP cameras. So we can use only native-tls for now.
-            // https://github.com/ctz/hyper-rustls/issues/56
-            client_builder = client_builder
-                .use_native_tls()
-                .danger_accept_invalid_certs(true);
+            client_builder = client_builder.use_native_tls();
         }
 
         client_builder
@@ -134,15 +228,33 @@ struct Config {
     reuse_digest_auth_headers: bool,
     timeout: Duration,
     fix_time_gap: Option<chrono::Duration>,
+    allow_username_token_over_http: bool,
+    max_redirections: u32,
+    max_response_bytes: usize,
+    #[cfg(feature = "tls")]
+    tls: TlsConfig,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Clone, Default)]
+struct TlsConfig {
+    root_certificates: Vec<reqwest::Certificate>,
+    accept_invalid_certs: bool,
+    accept_invalid_hostnames: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum AuthType {
-    /// First try to authorize with Digest and in case of error try UsernameToken auth
+    /// First try to authorize with Digest and in case of error try UsernameToken auth.
+    ///
+    /// Over plain HTTP, the fallback to UsernameToken needs
+    /// [ClientBuilder::allow_username_token_over_http].
     Any,
     /// Use only Digest auth
     Digest,
-    /// Use only UsernameToken auth
+    /// Use only UsernameToken auth.
+    ///
+    /// Over plain HTTP, this needs [ClientBuilder::allow_username_token_over_http].
     UsernameToken,
 }
 
@@ -223,6 +335,16 @@ impl Client {
             _ => None,
         };
 
+        if username_token.is_some()
+            && uri.scheme() != "https"
+            && !self.config.allow_username_token_over_http
+        {
+            return Err(Error::Authorization(
+                "UsernameToken over plain HTTP is disabled; use HTTPS or allow_username_token_over_http"
+                    .to_string(),
+            ));
+        }
+
         debug!(?auth_type, %redirections, "About to make request.");
 
         let soap_msg =
@@ -235,7 +357,7 @@ impl Client {
 
         if let RequestAuthType::Digest(digest) = auth_type {
             request = digest
-                .add_headers(request)
+                .add_headers_for(request, uri)
                 .map_err(|e| Error::Authorization(e.to_string()))?;
 
             debug!("Digest headers added");
@@ -269,10 +391,8 @@ impl Client {
                 digest.set_success();
             }
 
-            response
-                .text()
+            read_body(response, self.config.max_response_bytes)
                 .await
-                .map_err(|e| Error::Protocol(e.to_string()))
                 .and_then(|text| {
                     trace!("Response body: {text}");
                     let response =
@@ -295,7 +415,7 @@ impl Client {
                     digest.set_401(response);
                 }
                 _ => {
-                    if let Ok(text) = response.text().await {
+                    if let Ok(text) = read_body(response, self.config.max_response_bytes).await {
                         debug!("Got Unauthorized with body: {text}");
                     }
 
@@ -309,18 +429,27 @@ impl Client {
             // reqwest changes method on 302, so we have to handle redirections ourselves
             // https://github.com/seanmonstar/reqwest/issues/912
 
-            if redirections > 0 {
+            if redirections >= self.config.max_redirections {
                 return Err(Error::Redirection("Redirection limit exceeded".to_string()));
             }
 
-            let new_url = Client::get_redirect_location(&response)?;
+            let new_url = Client::get_redirect_location(uri, &response)?;
+
+            if !is_safe_redirect(uri, &new_url) {
+                return Err(Error::Redirection(format!(
+                    "Refusing to send credentials from {uri} to {new_url}: redirects must stay on \
+                     the same host and must not go from HTTPS to HTTP"
+                )));
+            }
 
             debug!("Redirecting to {new_url} ...");
 
             self.request_recursive(message, &new_url, auth_type, redirections + 1)
                 .await
         } else {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_body(response, self.config.max_response_bytes)
+                .await
+                .unwrap_or_default();
             debug!("Got HTTP error with body: {text}");
 
             let Err(soap::Error::Fault(fault)) = soap::unsoap(&text) else {
@@ -340,12 +469,36 @@ impl Client {
         }
     }
 
-    fn get_redirect_location(response: &reqwest::Response) -> Result<Url, Error> {
-        response.headers()[reqwest::header::LOCATION]
+    fn get_redirect_location(uri: &Url, response: &reqwest::Response) -> Result<Url, Error> {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| Error::Redirection("Redirect without a Location header".to_string()))?
             .to_str()
-            .map_err(|e| Error::Redirection(e.to_string()))?
-            .parse::<Url>()
+            .map_err(|e| Error::Redirection(e.to_string()))?;
+
+        // Location may be relative to the request URI.
+        uri.join(location)
             .map_err(|e| Error::Redirection(e.to_string()))
+    }
+
+    /// Returns a client for the same URI and settings with its own Digest auth state, so its
+    /// requests do not wait for requests made through `self` or its clones.
+    ///
+    /// Each client counts rejected logins separately, so with N such clients a camera can see up
+    /// to N times as many failed logins before they all stop.
+    pub fn with_own_auth_state(&self) -> Client {
+        let digest = Digest::new(
+            &self.config.uri,
+            &self.config.credentials,
+            self.config.reuse_digest_auth_headers,
+        );
+
+        Client {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            digest_auth_state: Arc::new(Mutex::new(digest)),
+        }
     }
 
     pub fn username_token_auth(&self) -> Option<UsernameToken> {
@@ -358,6 +511,42 @@ impl Client {
     pub fn set_fix_time_gap(&mut self, time_gap: Option<chrono::Duration>) {
         self.config.fix_time_gap = time_gap;
     }
+}
+
+/// Reads the response body as text, failing once it is longer than `limit` bytes, so a
+/// misbehaving device cannot make the client buffer an unbounded body.
+async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<String, Error> {
+    let too_large = || Error::Protocol(format!("Response body is larger than {limit} bytes"));
+
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err(too_large());
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Protocol(error_chain(&e)))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// Whether a redirect from `from` to `to` may carry the credentials: the same host, and no
+/// downgrade from HTTPS to HTTP. The port may change, as it does from HTTP to HTTPS.
+pub(crate) fn is_safe_redirect(from: &Url, to: &Url) -> bool {
+    let same_host = from.host() == to.host();
+    let downgrade = from.scheme() == "https" && to.scheme() != "https";
+    let known_scheme = matches!(to.scheme(), "http" | "https");
+
+    same_host && known_scheme && !downgrade
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::soap::client::{AuthType, ClientBuilder, Credentials};
+use crate::soap::client::{is_safe_redirect, AuthType, ClientBuilder, Credentials};
 use crate::utils::xml_eq::assert_xml_eq;
 use schema::{
     soap_envelope::{FaultcodeEnum, Reasontext, Subcode},
@@ -196,6 +196,7 @@ async fn authorization_error_reports_digest_and_username_token_results() {
 
     let client = ClientBuilder::new(&uri)
         .credentials(Some(credentials()))
+        .allow_username_token_over_http(true)
         .build();
 
     let error = client.request("<Good/>").await.unwrap_err();
@@ -203,6 +204,78 @@ async fn authorization_error_reports_digest_and_username_token_results() {
         error.to_string(),
         "Authorization failed: Digest: 401 Unauthorized, UsernameToken: 401 Unauthorized"
     );
+}
+
+#[tokio::test]
+async fn any_auth_does_not_fall_back_to_username_token_over_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let username_tokens = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_digest_rejecting_and_count_username_tokens(
+        listener,
+        username_tokens.clone(),
+    ));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Authorization failed: Digest: 401 Unauthorized, UsernameToken: UsernameToken over plain \
+         HTTP is disabled; use HTTPS or allow_username_token_over_http"
+    );
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn username_token_over_http_needs_opt_in() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let username_tokens = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_digest_rejecting_and_count_username_tokens(
+        listener,
+        username_tokens.clone(),
+    ));
+
+    let strict = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::UsernameToken)
+        .build();
+    strict.request("<Good/>").await.unwrap_err();
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 0);
+
+    let allowed = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::UsernameToken)
+        .allow_username_token_over_http(true)
+        .build();
+    allowed.request("<Good/>").await.unwrap();
+    assert_eq!(username_tokens.load(Ordering::SeqCst), 1);
+}
+
+/// Answers UsernameToken requests with success and counts them; challenges everything else.
+async fn serve_digest_rejecting_and_count_username_tokens(
+    listener: TcpListener,
+    username_tokens: Arc<AtomicUsize>,
+) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = if request.contains("UsernameToken") {
+            username_tokens.fetch_add(1, Ordering::SeqCst);
+            let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#;
+            http_response("200 OK", "", envelope)
+        } else {
+            let challenge =
+                "WWW-Authenticate: Digest realm=\"test\", qop=\"auth\", nonce=\"nonce\"\r\n";
+            http_response("401 Unauthorized", challenge, "")
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -362,4 +435,394 @@ fn http_response(status: &str, headers: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use tokio_native_tls::{native_tls, TlsAcceptor};
+
+    struct Server {
+        uri: Url,
+        certificate_pem: String,
+    }
+
+    /// Serves HTTPS on localhost with a fresh self-signed certificate for `names`.
+    async fn serve_https(names: &[&str]) -> Server {
+        let names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(names).unwrap();
+        let certificate_pem = cert.pem();
+        let identity = native_tls::Identity::from_pkcs8(
+            certificate_pem.as_bytes(),
+            key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A client that rejects the certificate closes the handshake.
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    while !String::from_utf8_lossy(&request).contains("</s:Envelope>") {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#;
+                    let response = http_response("200 OK", "", envelope);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.ok();
+                });
+            }
+        });
+
+        Server {
+            uri: format!("https://localhost:{port}/onvif/device_service")
+                .parse()
+                .unwrap(),
+            certificate_pem,
+        }
+    }
+
+    fn certificate(server: &Server) -> reqwest::Certificate {
+        reqwest::Certificate::from_pem(server.certificate_pem.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_an_untrusted_certificate_by_default() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri).build();
+
+        let error = client.request("<Good/>").await.unwrap_err();
+        assert!(
+            matches!(error, transport::Error::Connection(_)),
+            "{:?}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_a_pinned_certificate() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .build();
+
+        client.request("<Good/>").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_certificate_for_another_name_needs_hostname_opt_in() {
+        let server = serve_https(&["camera.example"]).await;
+
+        let strict = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .build();
+        strict.request("<Good/>").await.unwrap_err();
+
+        let relaxed = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .danger_accept_invalid_hostnames(true)
+            .build();
+        relaxed.request("<Good/>").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_any_certificate_only_when_asked() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri)
+            .danger_accept_invalid_certs(true)
+            .build();
+
+        client.request("<Good/>").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn digest_after_redirect_signs_the_new_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_redirect_then_digest(listener));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::Digest)
+        .build();
+
+    let result = client.request("<Good/>").await;
+    assert!(result.is_ok(), "{:?}", result);
+}
+
+#[tokio::test]
+async fn redirect_limit_is_configurable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_redirect_chain(listener));
+
+    // /onvif/device_service -> /hop1 -> /hop2 -> success
+    let default = ClientBuilder::new(&uri).build();
+    let error = default.request("<Good/>").await.unwrap_err();
+    assert!(
+        matches!(error, transport::Error::Redirection(_)),
+        "{:?}",
+        error
+    );
+
+    let two_hops = ClientBuilder::new(&uri).max_redirections(2).build();
+    two_hops.request("<Good/>").await.unwrap();
+}
+
+#[tokio::test]
+async fn redirect_to_another_host_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let response = http_response(
+        "307 Temporary Redirect",
+        "Location: http://attacker.example/onvif/device_service\r\n",
+        "",
+    );
+    tokio::spawn(serve_fixed_response(listener, response));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert!(
+        error.to_string().contains("Refusing to send credentials"),
+        "{}",
+        error
+    );
+}
+
+#[tokio::test]
+async fn redirect_without_location_is_an_error_not_a_panic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_fixed_response(
+        listener,
+        http_response("302 Found", "", ""),
+    ));
+
+    let client = ClientBuilder::new(&uri).build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert!(
+        matches!(error, transport::Error::Redirection(_)),
+        "{:?}",
+        error
+    );
+}
+
+#[test]
+fn safe_redirects() {
+    let url = |s: &str| s.parse::<Url>().unwrap();
+    let from = url("http://10.0.0.5/onvif/device_service");
+
+    assert!(is_safe_redirect(&from, &url("http://10.0.0.5/other")));
+    assert!(is_safe_redirect(&from, &url("https://10.0.0.5:8443/x")));
+    assert!(!is_safe_redirect(&from, &url("http://10.0.0.6/x")));
+    assert!(!is_safe_redirect(&from, &url("ftp://10.0.0.5/x")));
+    assert!(!is_safe_redirect(
+        &url("https://10.0.0.5/x"),
+        &url("http://10.0.0.5/x")
+    ));
+}
+
+fn request_path(request: &str) -> &str {
+    request.split_whitespace().nth(1).unwrap_or_default()
+}
+
+fn good_envelope() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#
+}
+
+/// Redirects the device service to `/moved` with a relative Location, where digest auth is
+/// required and the answer must sign `/moved`.
+async fn serve_redirect_then_digest(listener: TcpListener) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = if request_path(&request) != "/moved" {
+            http_response("307 Temporary Redirect", "Location: /moved\r\n", "")
+        } else if !has_digest_credentials(&request) {
+            let challenge =
+                "WWW-Authenticate: Digest realm=\"test\", qop=\"auth\", nonce=\"nonce\"\r\n";
+            http_response("401 Unauthorized", challenge, "")
+        } else if request.contains("uri=\"/moved\"") {
+            http_response("200 OK", "", good_envelope())
+        } else {
+            http_response("400 Bad Request", "", "")
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+}
+
+async fn serve_redirect_chain(listener: TcpListener) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = match request_path(&request) {
+            "/hop2" => http_response("200 OK", "", good_envelope()),
+            "/hop1" => http_response("307 Temporary Redirect", "Location: /hop2\r\n", ""),
+            _ => http_response("307 Temporary Redirect", "Location: /hop1\r\n", ""),
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_response_is_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let padding = "x".repeat(4096);
+    let envelope = format!(
+        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good>{padding}</Good></s:Body></s:Envelope>"#
+    );
+    tokio::spawn(serve_fixed_response(
+        listener,
+        http_response("200 OK", "", &envelope),
+    ));
+
+    let small = ClientBuilder::new(&uri).max_response_bytes(1024).build();
+    let error = small.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Protocol error: Response body is larger than 1024 bytes"
+    );
+
+    let default = ClientBuilder::new(&uri).build();
+    default.request("<Good/>").await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_chunked_response_is_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+
+    // No Content-Length, so the limit has to apply while reading.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            let chunk = format!("400\r\n{}\r\n", "x".repeat(0x400));
+            for _ in 0..8 {
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            stream.write_all(b"0\r\n\r\n").await.ok();
+        }
+    });
+
+    let client = ClientBuilder::new(&uri).max_response_bytes(2048).build();
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Protocol error: Response body is larger than 2048 bytes"
+    );
+}
+
+#[tokio::test]
+async fn clones_take_turns_but_clients_with_own_auth_state_run_in_parallel() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_slowly(
+        listener,
+        in_flight.clone(),
+        max_in_flight.clone(),
+    ));
+
+    let client = ClientBuilder::new(&uri).build();
+
+    let clone = client.clone();
+    let (a, b) = tokio::join!(client.request("<Good/>"), clone.request("<Good/>"));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(max_in_flight.swap(0, Ordering::SeqCst), 1);
+
+    let own = client.with_own_auth_state();
+    let (a, b) = tokio::join!(client.request("<Good/>"), own.request("<Good/>"));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+}
+
+/// Answers each request after 200 ms, recording how many were in flight at once.
+async fn serve_slowly(
+    listener: TcpListener,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let in_flight = in_flight.clone();
+        let max_in_flight = max_in_flight.clone();
+        tokio::spawn(async move {
+            read_request(&mut stream).await;
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            let response = http_response("200 OK", "", good_envelope());
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+    }
+}
+
+#[tokio::test]
+async fn unsubscribe_sends_a_ws_notification_unsubscribe() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        request_sender
+            .send(read_request(&mut stream).await)
+            .await
+            .unwrap();
+        let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"><s:Body><wsnt:UnsubscribeResponse/></s:Body></s:Envelope>"#;
+        let response = http_response("200 OK", "", envelope);
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let client = ClientBuilder::new(&uri).build();
+
+    schema::event::unsubscribe(&client, &Default::default())
+        .await
+        .unwrap();
+
+    let request = request_receiver.recv().await.unwrap();
+    assert!(request.contains("Unsubscribe"), "{}", request);
+    assert!(
+        request.contains("http://docs.oasis-open.org/wsn/b-2"),
+        "{}",
+        request
+    );
 }

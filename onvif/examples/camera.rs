@@ -33,6 +33,10 @@ struct Args {
     #[structopt(short = "a", long, default_value = "Any")]
     auth_type: String,
 
+    /// Allow UsernameToken auth over plain HTTP, for cameras that support nothing else
+    #[structopt(long)]
+    allow_username_token_over_http: bool,
+
     #[structopt(subcommand)]
     cmd: Cmd,
 }
@@ -110,6 +114,7 @@ impl Clients {
             devicemgmt: soap::client::ClientBuilder::new(&devicemgmt_uri)
                 .credentials(creds.clone())
                 .auth_type(auth_type.clone())
+                .allow_username_token_over_http(args.allow_username_token_over_http)
                 .build(),
             imaging: None,
             ptz: None,
@@ -163,6 +168,7 @@ impl Clients {
                 soap::client::ClientBuilder::new(&service_url)
                     .credentials(creds.clone())
                     .auth_type(auth_type.clone())
+                    .allow_username_token_over_http(args.allow_username_token_over_http)
                     .fix_time_gap(time_gap)
                     .build(),
             );
