@@ -9,7 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +19,6 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -30,22 +28,25 @@ jobs:
         run: cargo test
       - name: Run tests (no default features)
         run: cargo test -p onvif --no-default-features
+      - name: Run tests (TLS)
+        run: cargo test -p onvif --features tls
 
   clippy:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Catch common mistakes
         run: cargo clippy --workspace --tests --all-targets -- -D warnings
+      - name: Catch common mistakes (TLS)
+        run: cargo clippy -p onvif --features tls --tests --all-targets -- -D warnings
 
   rustfmt:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
