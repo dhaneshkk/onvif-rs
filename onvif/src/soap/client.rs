@@ -33,6 +33,7 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
     pub const DEFAULT_MAX_REDIRECTIONS: u32 = 1;
+    pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
     pub fn new(uri: &Url) -> Self {
         Self {
@@ -47,6 +48,7 @@ impl ClientBuilder {
                 fix_time_gap: None,
                 allow_username_token_over_http: false,
                 max_redirections: ClientBuilder::DEFAULT_MAX_REDIRECTIONS,
+                max_response_bytes: ClientBuilder::DEFAULT_MAX_RESPONSE_BYTES,
                 #[cfg(feature = "tls")]
                 tls: TlsConfig::default(),
             },
@@ -95,6 +97,13 @@ impl ClientBuilder {
     /// never from HTTPS to HTTP.
     pub fn max_redirections(mut self, max_redirections: u32) -> Self {
         self.config.max_redirections = max_redirections;
+        self
+    }
+
+    /// The largest response body to read, in bytes. Larger responses fail with a protocol error
+    /// instead of being read into memory. Default: [ClientBuilder::DEFAULT_MAX_RESPONSE_BYTES].
+    pub fn max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.config.max_response_bytes = max_response_bytes;
         self
     }
 
@@ -215,6 +224,7 @@ struct Config {
     fix_time_gap: Option<chrono::Duration>,
     allow_username_token_over_http: bool,
     max_redirections: u32,
+    max_response_bytes: usize,
     #[cfg(feature = "tls")]
     tls: TlsConfig,
 }
@@ -375,10 +385,8 @@ impl Client {
                 digest.set_success();
             }
 
-            response
-                .text()
+            read_body(response, self.config.max_response_bytes)
                 .await
-                .map_err(|e| Error::Protocol(e.to_string()))
                 .and_then(|text| {
                     trace!("Response body: {text}");
                     let response =
@@ -401,7 +409,7 @@ impl Client {
                     digest.set_401(response);
                 }
                 _ => {
-                    if let Ok(text) = response.text().await {
+                    if let Ok(text) = read_body(response, self.config.max_response_bytes).await {
                         debug!("Got Unauthorized with body: {text}");
                     }
 
@@ -433,7 +441,9 @@ impl Client {
             self.request_recursive(message, &new_url, auth_type, redirections + 1)
                 .await
         } else {
-            let text = response.text().await.unwrap_or_default();
+            let text = read_body(response, self.config.max_response_bytes)
+                .await
+                .unwrap_or_default();
             debug!("Got HTTP error with body: {text}");
 
             let Err(soap::Error::Fault(fault)) = soap::unsoap(&text) else {
@@ -476,6 +486,32 @@ impl Client {
     pub fn set_fix_time_gap(&mut self, time_gap: Option<chrono::Duration>) {
         self.config.fix_time_gap = time_gap;
     }
+}
+
+/// Reads the response body as text, failing once it is longer than `limit` bytes, so a
+/// misbehaving device cannot make the client buffer an unbounded body.
+async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<String, Error> {
+    let too_large = || Error::Protocol(format!("Response body is larger than {limit} bytes"));
+
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err(too_large());
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Protocol(error_chain(&e)))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|e| Error::Protocol(e.to_string()))
 }
 
 /// Whether a redirect from `from` to `to` may carry the credentials: the same host, and no

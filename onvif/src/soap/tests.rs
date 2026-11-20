@@ -690,3 +690,59 @@ async fn serve_redirect_chain(listener: TcpListener) {
         stream.write_all(response.as_bytes()).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn oversized_response_is_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let padding = "x".repeat(4096);
+    let envelope = format!(
+        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good>{padding}</Good></s:Body></s:Envelope>"#
+    );
+    tokio::spawn(serve_fixed_response(
+        listener,
+        http_response("200 OK", "", &envelope),
+    ));
+
+    let small = ClientBuilder::new(&uri).max_response_bytes(1024).build();
+    let error = small.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Protocol error: Response body is larger than 1024 bytes"
+    );
+
+    let default = ClientBuilder::new(&uri).build();
+    default.request("<Good/>").await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_chunked_response_is_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+
+    // No Content-Length, so the limit has to apply while reading.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            let chunk = format!("400\r\n{}\r\n", "x".repeat(0x400));
+            for _ in 0..8 {
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            stream.write_all(b"0\r\n\r\n").await.ok();
+        }
+    });
+
+    let client = ClientBuilder::new(&uri).max_response_bytes(2048).build();
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Protocol error: Response body is larger than 2048 bytes"
+    );
+}
