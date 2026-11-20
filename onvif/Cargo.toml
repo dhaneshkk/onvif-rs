@@ -37,6 +37,8 @@ yaserde_derive = "0.7"
 
 [dev-dependencies]
 dotenv = "0.15"
+rcgen = "0.13"
+tokio-native-tls = "0.3"
 futures-util = "0.3"
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }

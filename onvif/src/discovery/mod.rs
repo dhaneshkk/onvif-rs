@@ -372,7 +372,9 @@ impl DiscoveryBuilder {
 /// one batch, so a network with fewer hosts than `MAX_CONCURRENT_SOCK` gets the whole duration
 /// instead of a division by zero.
 fn time_per_unicast_probe(duration: Duration, probes: usize) -> Duration {
-    let batches = probes.div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK).max(1);
+    let batches = probes
+        .div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK)
+        .max(1);
     let batches = std::convert::TryFrom::try_from(batches).unwrap_or(u32::MAX);
 
     duration / batches
@@ -472,7 +474,9 @@ mod tests {
 
         for probes in 0..2048 {
             let per_probe = time_per_unicast_probe(duration, probes);
-            let batches = probes.div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK).max(1) as u32;
+            let batches = probes
+                .div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK)
+                .max(1) as u32;
 
             assert!(per_probe > Duration::ZERO, "{} probes", probes);
             assert!(per_probe * batches <= duration, "{} probes", probes);

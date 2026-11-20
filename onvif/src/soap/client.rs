@@ -44,6 +44,8 @@ impl ClientBuilder {
                 reuse_digest_auth_headers: false,
                 timeout: ClientBuilder::DEFAULT_TIMEOUT,
                 fix_time_gap: None,
+                #[cfg(feature = "tls")]
+                tls: TlsConfig::default(),
             },
         }
     }
@@ -83,14 +85,70 @@ impl ClientBuilder {
         self
     }
 
+    /// Trusts `certificate` as a root CA for HTTPS, in addition to the system roots.
+    ///
+    /// Use this for a site CA or for the camera's own self-signed certificate (pinning). Ignored
+    /// if a client is given with [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn add_root_certificate(mut self, certificate: reqwest::Certificate) -> Self {
+        self.config.tls.root_certificates.push(certificate);
+        self
+    }
+
+    /// Accepts any HTTPS certificate, including expired, self-signed and forged ones.
+    ///
+    /// Off by default. Turning it on makes HTTPS open to man-in-the-middle attacks, so prefer
+    /// [ClientBuilder::add_root_certificate]. Ignored if a client is given with
+    /// [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+        self.config.tls.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Accepts HTTPS certificates whose names do not match the host, while still checking that a
+    /// trusted CA signed them.
+    ///
+    /// Off by default. Cameras are often reached by an IP address that is missing from their
+    /// certificate; this allows that with a pinned certificate. Ignored if a client is given with
+    /// [ClientBuilder::http_client].
+    #[cfg(feature = "tls")]
+    pub fn danger_accept_invalid_hostnames(mut self, accept_invalid_hostnames: bool) -> Self {
+        self.config.tls.accept_invalid_hostnames = accept_invalid_hostnames;
+        self
+    }
+
+    /// Builds the client.
+    ///
+    /// # Panics
+    ///
+    /// If the HTTP client cannot be built, for example when the TLS backend fails to initialize.
+    /// Use [ClientBuilder::try_build] to handle that as an error.
     pub fn build(self) -> Client {
+        self.try_build().expect("Failed to build the HTTP client")
+    }
+
+    /// Builds the client, or returns the error if the HTTP client cannot be built.
+    pub fn try_build(self) -> Result<Client, reqwest::Error> {
         let client = if let Some(client) = self.client {
             client
         } else {
-            ClientBuilder::default_http_client_builder()
-                .timeout(self.config.timeout)
-                .build()
-                .unwrap()
+            #[allow(unused_mut)]
+            let mut builder =
+                ClientBuilder::default_http_client_builder().timeout(self.config.timeout);
+
+            #[cfg(feature = "tls")]
+            {
+                let tls = &self.config.tls;
+                for certificate in &tls.root_certificates {
+                    builder = builder.add_root_certificate(certificate.clone());
+                }
+                builder = builder
+                    .danger_accept_invalid_certs(tls.accept_invalid_certs)
+                    .danger_accept_invalid_hostnames(tls.accept_invalid_hostnames);
+            }
+
+            builder.build()?
         };
 
         let digest = Digest::new(
@@ -99,13 +157,15 @@ impl ClientBuilder {
             self.config.reuse_digest_auth_headers,
         );
 
-        Client {
+        Ok(Client {
             client,
             config: self.config,
             digest_auth_state: Arc::new(Mutex::new(digest)),
-        }
+        })
     }
 
+    /// The HTTP client builder this crate starts from: redirects off (they are handled per
+    /// request) and, with the `tls` feature, native TLS that verifies certificates.
     pub fn default_http_client_builder() -> reqwest::ClientBuilder {
         #[allow(unused_mut)]
         let mut client_builder =
@@ -113,12 +173,7 @@ impl ClientBuilder {
 
         #[cfg(feature = "tls")]
         {
-            // hyper-rustls does not support IP hosts (like https://192.168.1.2) which are
-            // very common for IP cameras. So we can use only native-tls for now.
-            // https://github.com/ctz/hyper-rustls/issues/56
-            client_builder = client_builder
-                .use_native_tls()
-                .danger_accept_invalid_certs(true);
+            client_builder = client_builder.use_native_tls();
         }
 
         client_builder
@@ -134,6 +189,16 @@ struct Config {
     reuse_digest_auth_headers: bool,
     timeout: Duration,
     fix_time_gap: Option<chrono::Duration>,
+    #[cfg(feature = "tls")]
+    tls: TlsConfig,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Clone, Default)]
+struct TlsConfig {
+    root_certificates: Vec<reqwest::Certificate>,
+    accept_invalid_certs: bool,
+    accept_invalid_hostnames: bool,
 }
 
 #[derive(Clone, Debug)]

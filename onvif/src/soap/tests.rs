@@ -363,3 +363,120 @@ fn http_response(status: &str, headers: &str, body: &str) -> String {
         body.len()
     )
 }
+
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use tokio_native_tls::{native_tls, TlsAcceptor};
+
+    struct Server {
+        uri: Url,
+        certificate_pem: String,
+    }
+
+    /// Serves HTTPS on localhost with a fresh self-signed certificate for `names`.
+    async fn serve_https(names: &[&str]) -> Server {
+        let names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(names).unwrap();
+        let certificate_pem = cert.pem();
+        let identity = native_tls::Identity::from_pkcs8(
+            certificate_pem.as_bytes(),
+            key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A client that rejects the certificate closes the handshake.
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    while !String::from_utf8_lossy(&request).contains("</s:Envelope>") {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#;
+                    let response = http_response("200 OK", "", envelope);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.ok();
+                });
+            }
+        });
+
+        Server {
+            uri: format!("https://localhost:{port}/onvif/device_service")
+                .parse()
+                .unwrap(),
+            certificate_pem,
+        }
+    }
+
+    fn certificate(server: &Server) -> reqwest::Certificate {
+        reqwest::Certificate::from_pem(server.certificate_pem.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_an_untrusted_certificate_by_default() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri).build();
+
+        let error = client.request("<Good/>").await.unwrap_err();
+        assert!(
+            matches!(error, transport::Error::Connection(_)),
+            "{:?}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_a_pinned_certificate() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .build();
+
+        client.request("<Good/>").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_certificate_for_another_name_needs_hostname_opt_in() {
+        let server = serve_https(&["camera.example"]).await;
+
+        let strict = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .build();
+        strict.request("<Good/>").await.unwrap_err();
+
+        let relaxed = ClientBuilder::new(&server.uri)
+            .add_root_certificate(certificate(&server))
+            .danger_accept_invalid_hostnames(true)
+            .build();
+        relaxed.request("<Good/>").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_any_certificate_only_when_asked() {
+        let server = serve_https(&["localhost"]).await;
+        let client = ClientBuilder::new(&server.uri)
+            .danger_accept_invalid_certs(true)
+            .build();
+
+        client.request("<Good/>").await.unwrap();
+    }
+}
