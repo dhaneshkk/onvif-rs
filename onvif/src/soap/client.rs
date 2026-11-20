@@ -17,6 +17,12 @@ use std::{
 use tracing::{debug, instrument, trace};
 use url::Url;
 
+/// An ONVIF SOAP client for one service URI.
+///
+/// Clones share the Digest auth state, so that rejected logins are counted across all of them
+/// and the client stops before a camera locks the account. Sharing that state means requests made
+/// through one client and its clones run one at a time. For requests that should run in parallel,
+/// such as an event pull loop next to PTZ commands, use [Client::with_own_auth_state].
 #[derive(Clone)]
 pub struct Client {
     client: reqwest::Client,
@@ -474,6 +480,25 @@ impl Client {
         // Location may be relative to the request URI.
         uri.join(location)
             .map_err(|e| Error::Redirection(e.to_string()))
+    }
+
+    /// Returns a client for the same URI and settings with its own Digest auth state, so its
+    /// requests do not wait for requests made through `self` or its clones.
+    ///
+    /// Each client counts rejected logins separately, so with N such clients a camera can see up
+    /// to N times as many failed logins before they all stop.
+    pub fn with_own_auth_state(&self) -> Client {
+        let digest = Digest::new(
+            &self.config.uri,
+            &self.config.credentials,
+            self.config.reuse_digest_auth_headers,
+        );
+
+        Client {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            digest_auth_state: Arc::new(Mutex::new(digest)),
+        }
     }
 
     pub fn username_token_auth(&self) -> Option<UsernameToken> {

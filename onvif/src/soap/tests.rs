@@ -746,3 +746,52 @@ async fn oversized_chunked_response_is_rejected() {
         "Protocol error: Response body is larger than 2048 bytes"
     );
 }
+
+#[tokio::test]
+async fn clones_take_turns_but_clients_with_own_auth_state_run_in_parallel() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_slowly(
+        listener,
+        in_flight.clone(),
+        max_in_flight.clone(),
+    ));
+
+    let client = ClientBuilder::new(&uri).build();
+
+    let clone = client.clone();
+    let (a, b) = tokio::join!(client.request("<Good/>"), clone.request("<Good/>"));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(max_in_flight.swap(0, Ordering::SeqCst), 1);
+
+    let own = client.with_own_auth_state();
+    let (a, b) = tokio::join!(client.request("<Good/>"), own.request("<Good/>"));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+}
+
+/// Answers each request after 200 ms, recording how many were in flight at once.
+async fn serve_slowly(
+    listener: TcpListener,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let in_flight = in_flight.clone();
+        let max_in_flight = max_in_flight.clone();
+        tokio::spawn(async move {
+            read_request(&mut stream).await;
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            let response = http_response("200 OK", "", good_envelope());
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+    }
+}
