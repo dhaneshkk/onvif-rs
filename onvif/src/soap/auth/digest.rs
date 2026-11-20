@@ -73,13 +73,24 @@ impl Digest {
         self.challenge.is_some() && self.rejections >= 2
     }
 
-    pub fn add_headers(&self, mut request: RequestBuilder) -> Result<RequestBuilder, Error> {
+    pub fn add_headers(&self, request: RequestBuilder) -> Result<RequestBuilder, Error> {
+        self.add_headers_for(request, &self.uri)
+    }
+
+    /// Like [Digest::add_headers], for a request to `uri` instead of the URI given to
+    /// [Digest::new], such as the target of a redirect. The digest covers the request path, so it
+    /// must be the path the request goes to.
+    pub fn add_headers_for(
+        &self,
+        mut request: RequestBuilder,
+        uri: &Url,
+    ) -> Result<RequestBuilder, Error> {
         match &self.challenge {
             None => Ok(request),
             Some(response) => {
                 let creds = self.creds.as_ref().ok_or(Error::NoCredentials)?;
 
-                request = request.header("Authorization", digest_auth(response, creds, &self.uri)?);
+                request = request.header("Authorization", digest_auth(response, creds, uri)?);
 
                 Ok(request)
             }

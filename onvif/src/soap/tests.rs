@@ -1,5 +1,5 @@
 use super::*;
-use crate::soap::client::{AuthType, ClientBuilder, Credentials};
+use crate::soap::client::{is_safe_redirect, AuthType, ClientBuilder, Credentials};
 use crate::utils::xml_eq::assert_xml_eq;
 use schema::{
     soap_envelope::{FaultcodeEnum, Reasontext, Subcode},
@@ -551,5 +551,142 @@ mod tls {
             .build();
 
         client.request("<Good/>").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn digest_after_redirect_signs_the_new_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_redirect_then_digest(listener));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .auth_type(AuthType::Digest)
+        .build();
+
+    let result = client.request("<Good/>").await;
+    assert!(result.is_ok(), "{:?}", result);
+}
+
+#[tokio::test]
+async fn redirect_limit_is_configurable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_redirect_chain(listener));
+
+    // /onvif/device_service -> /hop1 -> /hop2 -> success
+    let default = ClientBuilder::new(&uri).build();
+    let error = default.request("<Good/>").await.unwrap_err();
+    assert!(
+        matches!(error, transport::Error::Redirection(_)),
+        "{:?}",
+        error
+    );
+
+    let two_hops = ClientBuilder::new(&uri).max_redirections(2).build();
+    two_hops.request("<Good/>").await.unwrap();
+}
+
+#[tokio::test]
+async fn redirect_to_another_host_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let response = http_response(
+        "307 Temporary Redirect",
+        "Location: http://attacker.example/onvif/device_service\r\n",
+        "",
+    );
+    tokio::spawn(serve_fixed_response(listener, response));
+
+    let client = ClientBuilder::new(&uri)
+        .credentials(Some(credentials()))
+        .build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert!(
+        error.to_string().contains("Refusing to send credentials"),
+        "{}",
+        error
+    );
+}
+
+#[tokio::test]
+async fn redirect_without_location_is_an_error_not_a_panic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    tokio::spawn(serve_fixed_response(
+        listener,
+        http_response("302 Found", "", ""),
+    ));
+
+    let client = ClientBuilder::new(&uri).build();
+
+    let error = client.request("<Good/>").await.unwrap_err();
+    assert!(
+        matches!(error, transport::Error::Redirection(_)),
+        "{:?}",
+        error
+    );
+}
+
+#[test]
+fn safe_redirects() {
+    let url = |s: &str| s.parse::<Url>().unwrap();
+    let from = url("http://10.0.0.5/onvif/device_service");
+
+    assert!(is_safe_redirect(&from, &url("http://10.0.0.5/other")));
+    assert!(is_safe_redirect(&from, &url("https://10.0.0.5:8443/x")));
+    assert!(!is_safe_redirect(&from, &url("http://10.0.0.6/x")));
+    assert!(!is_safe_redirect(&from, &url("ftp://10.0.0.5/x")));
+    assert!(!is_safe_redirect(
+        &url("https://10.0.0.5/x"),
+        &url("http://10.0.0.5/x")
+    ));
+}
+
+fn request_path(request: &str) -> &str {
+    request.split_whitespace().nth(1).unwrap_or_default()
+}
+
+fn good_envelope() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><Good/></s:Body></s:Envelope>"#
+}
+
+/// Redirects the device service to `/moved` with a relative Location, where digest auth is
+/// required and the answer must sign `/moved`.
+async fn serve_redirect_then_digest(listener: TcpListener) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = if request_path(&request) != "/moved" {
+            http_response("307 Temporary Redirect", "Location: /moved\r\n", "")
+        } else if !has_digest_credentials(&request) {
+            let challenge =
+                "WWW-Authenticate: Digest realm=\"test\", qop=\"auth\", nonce=\"nonce\"\r\n";
+            http_response("401 Unauthorized", challenge, "")
+        } else if request.contains("uri=\"/moved\"") {
+            http_response("200 OK", "", good_envelope())
+        } else {
+            http_response("400 Bad Request", "", "")
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+}
+
+async fn serve_redirect_chain(listener: TcpListener) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+
+        let response = match request_path(&request) {
+            "/hop2" => http_response("200 OK", "", good_envelope()),
+            "/hop1" => http_response("307 Temporary Redirect", "Location: /hop2\r\n", ""),
+            _ => http_response("307 Temporary Redirect", "Location: /hop1\r\n", ""),
+        };
+
+        stream.write_all(response.as_bytes()).await.unwrap();
     }
 }

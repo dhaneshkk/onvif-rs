@@ -32,6 +32,7 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_REDIRECTIONS: u32 = 1;
 
     pub fn new(uri: &Url) -> Self {
         Self {
@@ -45,6 +46,7 @@ impl ClientBuilder {
                 timeout: ClientBuilder::DEFAULT_TIMEOUT,
                 fix_time_gap: None,
                 allow_username_token_over_http: false,
+                max_redirections: ClientBuilder::DEFAULT_MAX_REDIRECTIONS,
                 #[cfg(feature = "tls")]
                 tls: TlsConfig::default(),
             },
@@ -83,6 +85,16 @@ impl ClientBuilder {
 
     pub fn fix_time_gap(mut self, time_gap: Option<chrono::Duration>) -> Self {
         self.config.fix_time_gap = time_gap;
+        self
+    }
+
+    /// How many redirects to follow for one request. Default:
+    /// [ClientBuilder::DEFAULT_MAX_REDIRECTIONS].
+    ///
+    /// Redirects carry the credentials, so only redirects to the same host are followed, and
+    /// never from HTTPS to HTTP.
+    pub fn max_redirections(mut self, max_redirections: u32) -> Self {
+        self.config.max_redirections = max_redirections;
         self
     }
 
@@ -202,6 +214,7 @@ struct Config {
     timeout: Duration,
     fix_time_gap: Option<chrono::Duration>,
     allow_username_token_over_http: bool,
+    max_redirections: u32,
     #[cfg(feature = "tls")]
     tls: TlsConfig,
 }
@@ -328,7 +341,7 @@ impl Client {
 
         if let RequestAuthType::Digest(digest) = auth_type {
             request = digest
-                .add_headers(request)
+                .add_headers_for(request, uri)
                 .map_err(|e| Error::Authorization(e.to_string()))?;
 
             debug!("Digest headers added");
@@ -402,11 +415,18 @@ impl Client {
             // reqwest changes method on 302, so we have to handle redirections ourselves
             // https://github.com/seanmonstar/reqwest/issues/912
 
-            if redirections > 0 {
+            if redirections >= self.config.max_redirections {
                 return Err(Error::Redirection("Redirection limit exceeded".to_string()));
             }
 
-            let new_url = Client::get_redirect_location(&response)?;
+            let new_url = Client::get_redirect_location(uri, &response)?;
+
+            if !is_safe_redirect(uri, &new_url) {
+                return Err(Error::Redirection(format!(
+                    "Refusing to send credentials from {uri} to {new_url}: redirects must stay on \
+                     the same host and must not go from HTTPS to HTTP"
+                )));
+            }
 
             debug!("Redirecting to {new_url} ...");
 
@@ -433,11 +453,16 @@ impl Client {
         }
     }
 
-    fn get_redirect_location(response: &reqwest::Response) -> Result<Url, Error> {
-        response.headers()[reqwest::header::LOCATION]
+    fn get_redirect_location(uri: &Url, response: &reqwest::Response) -> Result<Url, Error> {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| Error::Redirection("Redirect without a Location header".to_string()))?
             .to_str()
-            .map_err(|e| Error::Redirection(e.to_string()))?
-            .parse::<Url>()
+            .map_err(|e| Error::Redirection(e.to_string()))?;
+
+        // Location may be relative to the request URI.
+        uri.join(location)
             .map_err(|e| Error::Redirection(e.to_string()))
     }
 
@@ -451,6 +476,16 @@ impl Client {
     pub fn set_fix_time_gap(&mut self, time_gap: Option<chrono::Duration>) {
         self.config.fix_time_gap = time_gap;
     }
+}
+
+/// Whether a redirect from `from` to `to` may carry the credentials: the same host, and no
+/// downgrade from HTTPS to HTTP. The port may change, as it does from HTTP to HTTPS.
+pub(crate) fn is_safe_redirect(from: &Url, to: &Url) -> bool {
+    let same_host = from.host() == to.host();
+    let downgrade = from.scheme() == "https" && to.scheme() != "https";
+    let known_scheme = matches!(to.scheme(), "http" | "https");
+
+    same_host && known_scheme && !downgrade
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
