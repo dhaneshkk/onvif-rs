@@ -795,3 +795,34 @@ async fn serve_slowly(
         });
     }
 }
+
+#[tokio::test]
+async fn unsubscribe_sends_a_ws_notification_unsubscribe() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = device_uri(&listener);
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        request_sender
+            .send(read_request(&mut stream).await)
+            .await
+            .unwrap();
+        let envelope = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"><s:Body><wsnt:UnsubscribeResponse/></s:Body></s:Envelope>"#;
+        let response = http_response("200 OK", "", envelope);
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let client = ClientBuilder::new(&uri).build();
+
+    schema::event::unsubscribe(&client, &Default::default())
+        .await
+        .unwrap();
+
+    let request = request_receiver.recv().await.unwrap();
+    assert!(request.contains("Unsubscribe"), "{}", request);
+    assert!(
+        request.contains("http://docs.oasis-open.org/wsn/b-2"),
+        "{}",
+        request
+    );
+}

@@ -377,8 +377,9 @@ pub async fn set_synchronization_point<T: transport::Transport>(
 // The device shall provide the following Unsubscribe command for all
 // SubscriptionManager endpoints returned by the CreatePullPointSubscription
 // command.
-// pub async fn unsubscribe<T: transport::Transport>(
-//     transport: &T
-// ) -> Result<, transport::Error> {
-// transport::request(transport, request).await
-// }
+pub async fn unsubscribe<T: transport::Transport>(
+    transport: &T,
+    request: &wsnt::Unsubscribe,
+) -> Result<wsnt::UnsubscribeResponse, transport::Error> {
+    transport::request(transport, request).await
+}
