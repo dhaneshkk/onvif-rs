@@ -153,10 +153,7 @@ impl DiscoveryBuilder {
             ));
         }
 
-        let total_socks = unicast_requests.len();
-        let batches = (total_socks / Self::MAX_CONCURRENT_SOCK) as f64;
-
-        let max_time_per_sock = Duration::from_secs_f64(duration.as_secs_f64() / batches);
+        let max_time_per_sock = time_per_unicast_probe(*duration, unicast_requests.len());
 
         let produce_devices = async move {
             let futures = unicast_requests
@@ -368,6 +365,19 @@ impl DiscoveryBuilder {
     }
 }
 
+/// How long to wait for each unicast probe, so that all `probes`, sent
+/// [DiscoveryBuilder::MAX_CONCURRENT_SOCK] at a time, fit into `duration`.
+///
+/// The probes go out in `ceil(probes / MAX_CONCURRENT_SOCK)` batches, and there is always at least
+/// one batch, so a network with fewer hosts than `MAX_CONCURRENT_SOCK` gets the whole duration
+/// instead of a division by zero.
+fn time_per_unicast_probe(duration: Duration, probes: usize) -> Duration {
+    let batches = probes.div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK).max(1);
+    let batches = std::convert::TryFrom::try_from(batches).unwrap_or(u32::MAX);
+
+    duration / batches
+}
+
 async fn recv_string(s: &UdpSocket) -> io::Result<(String, SocketAddr)> {
     let mut buf = vec![0; 16 * 1024];
     let (len, src) = s.recv_from(&mut buf).await?;
@@ -439,6 +449,51 @@ mod tests {
             .await;
 
         println!("Devices found: {:?}", devices);
+    }
+
+    #[test]
+    fn unicast_probe_time_fits_small_networks() {
+        let duration = Duration::from_secs(4);
+
+        // Fewer hosts than one batch, e.g. a /27 camera VLAN or an empty /32: the whole duration.
+        assert_eq!(time_per_unicast_probe(duration, 0), duration);
+        assert_eq!(time_per_unicast_probe(duration, 30), duration);
+        assert_eq!(time_per_unicast_probe(duration, 32), duration);
+
+        // 33..=64 hosts take two batches.
+        assert_eq!(time_per_unicast_probe(duration, 33), duration / 2);
+        // A /24 has 254 hosts: 8 batches, so the probes finish within the duration.
+        assert_eq!(time_per_unicast_probe(duration, 254), duration / 8);
+    }
+
+    #[test]
+    fn unicast_probe_batches_never_exceed_duration() {
+        let duration = Duration::from_millis(5000);
+
+        for probes in 0..2048 {
+            let per_probe = time_per_unicast_probe(duration, probes);
+            let batches = probes.div_ceil(DiscoveryBuilder::MAX_CONCURRENT_SOCK).max(1) as u32;
+
+            assert!(per_probe > Duration::ZERO, "{} probes", probes);
+            assert!(per_probe * batches <= duration, "{} probes", probes);
+        }
+    }
+
+    #[tokio::test]
+    async fn unicast_discovery_on_a_small_network_does_not_panic() {
+        let devices = DiscoveryBuilder::default()
+            .duration(Duration::from_millis(200))
+            .discovery_mode(DiscoveryMode::Unicast {
+                network: Ipv4Addr::new(127, 0, 0, 0),
+                network_mask: Ipv4Addr::new(255, 255, 255, 224),
+            })
+            .run()
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(devices.is_empty());
     }
 
     #[test]
